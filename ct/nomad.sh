@@ -268,9 +268,59 @@ FIX
   fi
 fi
 note "Container ${ctid}: base setup output follows."
-set -o pipefail
-"$real" -n "$ctid" -- "${cmd[@]}" </dev/null 2>&1 | tee -a "$log"
-exit "${PIPESTATUS[0]}"
+session="$(printf '%s\n' "${cmd[@]}" | sed -n 's/.*\.install-\([0-9A-Fa-f][0-9A-Fa-f]*\)\.pid.*/\1/p' | head -n 1)"
+wait_ready() {
+  local i
+  for i in $(seq 1 60); do
+    if ! pct status "$ctid" 2>/dev/null | grep -q 'status: running'; then
+      note "Container ${ctid} is not running (reboot?). Starting it (${i}/60)..."
+      pct start "$ctid" >/dev/null 2>&1 || true
+      sleep 5
+      continue
+    fi
+    if "$real" -n "$ctid" -- true </dev/null >/dev/null 2>&1; then
+      return 0
+    fi
+    note "Container ${ctid} is up but not accepting commands yet (${i}/60)..."
+    sleep 5
+  done
+  note "Container ${ctid} did not accept commands within 5 minutes."
+  return 1
+}
+run_once() {
+  set -o pipefail
+  "$real" -n "$ctid" -- "${cmd[@]}" </dev/null 2>&1 | tee -a "$log"
+  return "${PIPESTATUS[0]}"
+}
+if [[ -z "$session" ]]; then
+  run_once
+  exit $?
+fi
+rc=1
+for try in 1 2 3; do
+  if ! wait_ready; then
+    rc=1
+    continue
+  fi
+  note "Install attempt ${try}/3 in container ${ctid}."
+  note "In-container log: pct exec ${ctid} -- tail -f /root/.install-${session}.log"
+  "$real" -n "$ctid" -- bash -c "touch /root/.install-${session}.log; echo \"[\$(date '+%Y-%m-%d %H:%M:%S')] install attempt ${try}\" >> /root/.install-${session}.log" </dev/null >/dev/null 2>&1 || true
+  run_once
+  rc=$?
+  bytes="$("$real" -n "$ctid" -- bash -c "wc -c < /root/.install-${session}.log 2>/dev/null || echo 0" </dev/null 2>/dev/null | tr -d '[:space:]')"
+  [[ "$bytes" =~ ^[0-9]+$ ]] || bytes=0
+  if [[ $rc -eq 0 ]]; then
+    exit 0
+  fi
+  running="$(pct status "$ctid" 2>/dev/null || true)"
+  if [[ "$running" == "status: running" && "$bytes" -gt 150 ]]; then
+    note "Install exited ${rc} after writing ${bytes} bytes. Not retrying a real failure."
+    exit "$rc"
+  fi
+  note "No install log yet (exit ${rc}, ${bytes} bytes). The container may still be rebooting. Retrying."
+  sleep 10
+done
+exit "$rc"
 EOF
   chmod 755 "$dest"
 }
@@ -298,6 +348,40 @@ _nomad_write_guest_script "${_nomad_stage}/nomad-guest-setup.sh"
 _nomad_write_post_hook "${_nomad_stage}/nomad-post-install.sh" "${_nomad_stage}/nomad-guest-setup.sh"
 _nomad_write_attach_wrapper "${_nomad_stage}/bin/lxc-attach"
 unset _nomad_self _dir
+
+# Re-run Docker + Project NOMAD inside a container that already exists.
+# The create step can fail after "Container customized" when the guest reboots
+# and the first attach finds no install log. Example:
+#   NOMAD_CTID=103 bash nomad.sh
+if [[ -n "${NOMAD_CTID:-}" ]]; then
+  echo "Retrying Project NOMAD install in existing container ${NOMAD_CTID}"
+  echo "Live log: tail -f /tmp/nomad-ct-${NOMAD_CTID}.log"
+  ready=0
+  for i in $(seq 1 60); do
+    if ! pct status "$NOMAD_CTID" 2>/dev/null | grep -q 'status: running'; then
+      echo "Container ${NOMAD_CTID} is not running (reboot?). Starting it (${i}/60)..."
+      pct start "$NOMAD_CTID" >/dev/null 2>&1 || true
+      sleep 5
+      continue
+    fi
+    if pct exec "$NOMAD_CTID" -- true >/dev/null 2>&1; then
+      ready=1
+      break
+    fi
+    echo "Container ${NOMAD_CTID} is up but not accepting commands yet (${i}/60)..."
+    sleep 5
+  done
+  if [[ "$ready" -ne 1 ]]; then
+    echo "Container ${NOMAD_CTID} did not accept commands within 5 minutes." >&2
+    exit 1
+  fi
+  pct push "$NOMAD_CTID" "${_nomad_stage}/nomad-guest-setup.sh" /root/nomad-guest-setup.sh
+  set -o pipefail
+  pct exec "$NOMAD_CTID" -- bash /root/nomad-guest-setup.sh 2>&1 | tee -a "/tmp/nomad-ct-${NOMAD_CTID}.log"
+  rc=${PIPESTATUS[0]}
+  pct exec "$NOMAD_CTID" -- rm -f /root/nomad-guest-setup.sh >/dev/null 2>&1 || true
+  exit "$rc"
+fi
 
 _cs_boot="${COMMUNITY_SCRIPTS_CORE_DIR:-$(dirname "${BASH_SOURCE[0]}")/../../core}/core/build.func"
 source "$_cs_boot" 2>/dev/null || source <(curl -fsSL "${COMMUNITY_SCRIPTS_CORE_URL:-https://raw.githubusercontent.com/community-scripts/core/main}/core/build.func")
