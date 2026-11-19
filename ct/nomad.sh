@@ -61,7 +61,6 @@ ExecStart=-/sbin/agetty --autologin root --noclear --keep-baud console 115200,38
 UNIT
   grep -q '^TERM=linux' /etc/environment 2>/dev/null || echo 'TERM=linux' >>/etc/environment
   systemctl daemon-reload 2>/dev/null || true
-  systemctl restart container-getty@1.service console-getty.service 2>/dev/null || true
 fi
 
 setting_up_container
@@ -228,9 +227,18 @@ done
 if [[ -z "$ctid" || ${#cmd[@]} -eq 0 ]]; then
   exec "$real" "$@"
 fi
+log="/tmp/nomad-ct-${ctid}.log"
+note() {
+  printf '%s\n' "$*" >>"$log"
+  printf '%s\n' "$*" >/dev/tty 2>/dev/null || printf '%s\n' "$*"
+}
+note ""
+note "Container ${ctid}: this is the step after \"Container customized\"."
+note "Live log (other shell): tail -f ${log}"
 flag="${TMPDIR:-/tmp}/nomad-console-fixed-${ctid}"
 if [[ ! -f "$flag" ]]; then
-  if "$real" -n "$ctid" -- bash -s >/dev/null 2>&1 <<'FIX'; then
+  note "Container ${ctid}: writing the tty1 console fix."
+  if "$real" -n "$ctid" -- bash -s >>"$log" 2>&1 <<'FIX'; then
 set +e
 if command -v systemctl >/dev/null 2>&1; then
   install -d /etc/systemd/system/container-getty@1.service.d \
@@ -252,13 +260,17 @@ ExecStart=-/sbin/agetty --autologin root --noclear --keep-baud console 115200,38
 UNIT
   grep -q '^TERM=linux' /etc/environment 2>/dev/null || echo 'TERM=linux' >>/etc/environment
   systemctl daemon-reload 2>/dev/null || true
-  systemctl restart container-getty@1.service console-getty.service 2>/dev/null || true
 fi
 FIX
     touch "$flag" 2>/dev/null || true
+  else
+    note "Container ${ctid}: console fix did not apply; continuing."
   fi
 fi
-exec "$real" -n "$ctid" -- "${cmd[@]}" </dev/null
+note "Container ${ctid}: base setup output follows."
+set -o pipefail
+"$real" -n "$ctid" -- "${cmd[@]}" </dev/null 2>&1 | tee -a "$log"
+exit "${PIPESTATUS[0]}"
 EOF
   chmod 755 "$dest"
 }
@@ -346,6 +358,9 @@ start
 # cursor-position replies. Set after the wizard so Default cannot clear it.
 CT_CMODE=shell
 export CT_CMODE
+VERBOSE=yes
+var_verbose=yes
+export VERBOSE var_verbose
 var_post_install="${_nomad_stage}/nomad-post-install.sh"
 export var_post_install
 export PATH="${_nomad_stage}/bin:${PATH}"
