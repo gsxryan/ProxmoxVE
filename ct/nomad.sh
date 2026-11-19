@@ -28,48 +28,10 @@ _nomad_write_install_script() {
   mkdir -p "$(dirname "$dest")"
   cat >"$dest" <<'EOF'
 #!/usr/bin/env bash
-# Base Ubuntu setup only. Docker and Project NOMAD are the host post-install hook.
-# Copyright (c) 2021-2026 community-scripts ORG
-# License: MIT | https://github.com/community-scripts/ProxmoxVE/raw/main/LICENSE
-# Source: https://ubuntu.com/
-
-source /dev/stdin <<<"$FUNCTIONS_FILE_PATH"
-color
-verb_ip6
-catch_errors
-
-# tty1 on Ubuntu 26.04 is agetty. It sends ESC[6n, Proxmox noVNC answers
-# ^[[24;80R, and that answer is used as the login name, so the console
-# never reaches a shell. TERM=linux stops the query; autologin skips the prompt.
-if command -v systemctl >/dev/null 2>&1; then
-  install -d /etc/systemd/system/container-getty@1.service.d \
-    /etc/systemd/system/container-getty@2.service.d \
-    /etc/systemd/system/console-getty.service.d
-  for unit in container-getty@1 container-getty@2; do
-    cat >"/etc/systemd/system/${unit}.service.d/override.conf" <<'UNIT'
-[Service]
-Environment=TERM=linux
-ExecStart=
-ExecStart=-/sbin/agetty --autologin root --noclear --keep-baud tty%I 115200,38400,9600 linux
-UNIT
-  done
-  cat >/etc/systemd/system/console-getty.service.d/override.conf <<'UNIT'
-[Service]
-Environment=TERM=linux
-ExecStart=
-ExecStart=-/sbin/agetty --autologin root --noclear --keep-baud console 115200,38400,9600 linux
-UNIT
-  grep -q '^TERM=linux' /etc/environment 2>/dev/null || echo 'TERM=linux' >>/etc/environment
-  systemctl daemon-reload 2>/dev/null || true
-fi
-
-setting_up_container
-network_check
-update_os
-
-motd_ssh
-customize
-cleanup_lxc
+# The engine runs this through the container console. Keep it empty.
+# Docker and Project NOMAD are installed from the Proxmox host with pct exec.
+echo "Host will install Project NOMAD with pct exec. Nothing to do in this console."
+exit 0
 EOF
   chmod 755 "$dest"
 }
@@ -79,9 +41,14 @@ _nomad_write_guest_script() {
   local dest="$1"
   cat >"$dest" <<'EOF'
 #!/usr/bin/env bash
-# Inside the Ubuntu 26.04 LXC. Docker first, then Project NOMAD.
+# Inside the Ubuntu 26.04 LXC. Invoked by pct exec from the Proxmox host.
+# stdin is closed on purpose so a prompt cannot sit there unseen.
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
+export APT_LISTCHANGES_FRONTEND=none
+export NEEDRESTART_MODE=a
+exec > >(tee -a /root/nomad-setup.log) 2>&1
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] pct exec from the host started"
 NOMAD_INSTALL_URL="https://raw.githubusercontent.com/Crosstalk-Solutions/project-nomad/refs/heads/main/install/install_nomad.sh"
 
 echo "Installing prerequisites"
@@ -184,15 +151,18 @@ say() {
   printf '%s\n' "\$*"
   printf '%s\n' "\$*" >/dev/tty 2>/dev/null || true
 }
-say "Installing Docker and Project NOMAD in CT \${CTID} with pct exec"
-pct push "\${CTID}" "${guest}" /root/nomad-guest-setup.sh
+# pct from a PATH that does not contain this script's lxc-attach wrapper.
+pct_host() {
+  env PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" pct "\$@"
+}
+say "Installing Docker and Project NOMAD in CT \${CTID}"
+say "This is pct exec on the Proxmox host, not the container console."
+say "Live log: tail -f /tmp/nomad-ct-\${CTID}.log"
+say "Or:       pct exec \${CTID} -- tail -f /root/nomad-setup.log"
+pct_host push "\${CTID}" "${guest}" /root/nomad-guest-setup.sh
 set -o pipefail
-if [[ -e /dev/tty ]]; then
-  pct exec "\${CTID}" -- bash /root/nomad-guest-setup.sh | tee /dev/tty
-else
-  pct exec "\${CTID}" -- bash /root/nomad-guest-setup.sh
-fi
-pct exec "\${CTID}" -- rm -f /root/nomad-guest-setup.sh
+pct_host exec "\${CTID}" -- bash /root/nomad-guest-setup.sh </dev/null 2>&1 | tee -a "/tmp/nomad-ct-\${CTID}.log" | tee /dev/tty
+pct_host exec "\${CTID}" -- rm -f /root/nomad-guest-setup.sh >/dev/null 2>&1 || true
 say "Project NOMAD is ready at http://\${IP:-<container-ip>}:8080"
 EOF
   chmod 755 "$dest"
@@ -235,92 +205,36 @@ note() {
 note ""
 note "Container ${ctid}: this is the step after \"Container customized\"."
 note "Live log (other shell): tail -f ${log}"
-flag="${TMPDIR:-/tmp}/nomad-console-fixed-${ctid}"
-if [[ ! -f "$flag" ]]; then
-  note "Container ${ctid}: writing the tty1 console fix."
-  if "$real" -n "$ctid" -- bash -s >>"$log" 2>&1 <<'FIX'; then
-set +e
-if command -v systemctl >/dev/null 2>&1; then
-  install -d /etc/systemd/system/container-getty@1.service.d \
-    /etc/systemd/system/container-getty@2.service.d \
-    /etc/systemd/system/console-getty.service.d
-  for unit in container-getty@1 container-getty@2; do
-    cat >"/etc/systemd/system/${unit}.service.d/override.conf" <<'UNIT'
-[Service]
-Environment=TERM=linux
-ExecStart=
-ExecStart=-/sbin/agetty --autologin root --noclear --keep-baud tty%I 115200,38400,9600 linux
-UNIT
-  done
-  cat >/etc/systemd/system/console-getty.service.d/override.conf <<'UNIT'
-[Service]
-Environment=TERM=linux
-ExecStart=
-ExecStart=-/sbin/agetty --autologin root --noclear --keep-baud console 115200,38400,9600 linux
-UNIT
-  grep -q '^TERM=linux' /etc/environment 2>/dev/null || echo 'TERM=linux' >>/etc/environment
-  systemctl daemon-reload 2>/dev/null || true
-fi
-FIX
-    touch "$flag" 2>/dev/null || true
-  else
-    note "Container ${ctid}: console fix did not apply; continuing."
-  fi
-fi
-note "Container ${ctid}: base setup output follows."
 session="$(printf '%s\n' "${cmd[@]}" | sed -n 's/.*\.install-\([0-9A-Fa-f][0-9A-Fa-f]*\)\.pid.*/\1/p' | head -n 1)"
-wait_ready() {
-  local i
+pct_host() {
+  env PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" pct "$@"
+}
+# The engine's install is a console attach. That is what stalls on the login
+# prompt. Mark it finished from the host. Docker and NOMAD are pct exec.
+if [[ -n "$session" ]]; then
+  note "Container ${ctid}: not opening the console."
+  note "Docker and Project NOMAD run next with pct exec from this host."
+  note "Follow: tail -f ${log}"
+  note "And:    pct exec ${ctid} -- tail -f /root/nomad-setup.log"
   for i in $(seq 1 60); do
+    if pct_host exec "$ctid" -- true </dev/null >/dev/null 2>&1; then
+      pct_host exec "$ctid" -- bash -c "echo \"[\$(date '+%F %T')] console attach skipped\" >> /root/.install-${session}.log" </dev/null >/dev/null 2>&1 || true
+      exit 0
+    fi
     if ! pct status "$ctid" 2>/dev/null | grep -q 'status: running'; then
-      note "Container ${ctid} is not running (reboot?). Starting it (${i}/60)..."
-      pct start "$ctid" >/dev/null 2>&1 || true
-      sleep 5
-      continue
+      note "Container ${ctid} is not running. Starting it (${i}/60)..."
+      pct_host start "$ctid" >/dev/null 2>&1 || true
+    else
+      note "Container ${ctid} is not accepting pct exec yet (${i}/60)..."
     fi
-    if "$real" -n "$ctid" -- true </dev/null >/dev/null 2>&1; then
-      return 0
-    fi
-    note "Container ${ctid} is up but not accepting commands yet (${i}/60)..."
     sleep 5
   done
-  note "Container ${ctid} did not accept commands within 5 minutes."
-  return 1
-}
-run_once() {
-  set -o pipefail
-  "$real" -n "$ctid" -- "${cmd[@]}" </dev/null 2>&1 | tee -a "$log"
-  return "${PIPESTATUS[0]}"
-}
-if [[ -z "$session" ]]; then
-  run_once
-  exit $?
+  note "Container ${ctid} did not accept pct exec within 5 minutes."
+  exit 1
 fi
-rc=1
-for try in 1 2 3; do
-  if ! wait_ready; then
-    rc=1
-    continue
-  fi
-  note "Install attempt ${try}/3 in container ${ctid}."
-  note "In-container log: pct exec ${ctid} -- tail -f /root/.install-${session}.log"
-  "$real" -n "$ctid" -- bash -c "touch /root/.install-${session}.log; echo \"[\$(date '+%Y-%m-%d %H:%M:%S')] install attempt ${try}\" >> /root/.install-${session}.log" </dev/null >/dev/null 2>&1 || true
-  run_once
-  rc=$?
-  bytes="$("$real" -n "$ctid" -- bash -c "wc -c < /root/.install-${session}.log 2>/dev/null || echo 0" </dev/null 2>/dev/null | tr -d '[:space:]')"
-  [[ "$bytes" =~ ^[0-9]+$ ]] || bytes=0
-  if [[ $rc -eq 0 ]]; then
-    exit 0
-  fi
-  running="$(pct status "$ctid" 2>/dev/null || true)"
-  if [[ "$running" == "status: running" && "$bytes" -gt 150 ]]; then
-    note "Install exited ${rc} after writing ${bytes} bytes. Not retrying a real failure."
-    exit "$rc"
-  fi
-  note "No install log yet (exit ${rc}, ${bytes} bytes). The container may still be rebooting. Retrying."
-  sleep 10
-done
-exit "$rc"
+set -o pipefail
+"$real" -n "$ctid" -- "${cmd[@]}" </dev/null 2>&1 | tee -a "$log"
+exit "${PIPESTATUS[0]}"
 EOF
   chmod 755 "$dest"
 }
@@ -377,7 +291,7 @@ if [[ -n "${NOMAD_CTID:-}" ]]; then
   fi
   pct push "$NOMAD_CTID" "${_nomad_stage}/nomad-guest-setup.sh" /root/nomad-guest-setup.sh
   set -o pipefail
-  pct exec "$NOMAD_CTID" -- bash /root/nomad-guest-setup.sh 2>&1 | tee -a "/tmp/nomad-ct-${NOMAD_CTID}.log"
+  pct exec "$NOMAD_CTID" -- bash /root/nomad-guest-setup.sh </dev/null 2>&1 | tee -a "/tmp/nomad-ct-${NOMAD_CTID}.log"
   rc=${PIPESTATUS[0]}
   pct exec "$NOMAD_CTID" -- rm -f /root/nomad-guest-setup.sh >/dev/null 2>&1 || true
   exit "$rc"
