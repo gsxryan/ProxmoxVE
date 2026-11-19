@@ -3,9 +3,10 @@
 # Upstream CT pattern: https://github.com/community-scripts/ProxmoxVE/blob/main/ct/ubuntu.sh
 # Application:          https://github.com/Crosstalk-Solutions/project-nomad
 #
-# Creates an unprivileged Ubuntu 26.04 LXC (nesting + keyctl, so Docker works),
-# installs Docker Engine from Docker's Ubuntu apt repository, and only then
-# deploys Project NOMAD:
+# Creates an unprivileged Ubuntu 26.04 LXC, then uses the engine's
+# var_post_install hook (runs on the Proxmox host, after the CT is up)
+# to install Docker and Project NOMAD with pct exec. That avoids typing
+# the installer into the guest console, which sits at a login prompt.
 #   https://docs.docker.com/engine/install/ubuntu/
 #   https://raw.githubusercontent.com/Crosstalk-Solutions/project-nomad/refs/heads/main/install/install_nomad.sh
 #
@@ -17,18 +18,19 @@
 # much more (about 32 GiB RAM and 250 GiB disk). Override before launch, e.g.:
 #   var_cpu=8 var_ram=32768 var_disk=250 bash nomad.sh
 
-# The engine loads install/${var_install}.sh from a scripts root that contains
-# both ct/ and install/. This file carries that installer with it, so a single
-# download still deploys NOMAD.
+# install/nomad-install.sh is what the engine runs with lxc-attach while it
+# still owns the terminal. Keep that step to base OS setup. Docker and NOMAD
+# run later from the host post-install hook, via pct exec, so nothing is
+# pasted into the guest's login prompt.
 _nomad_write_install_script() {
   local dest="$1"
   mkdir -p "$(dirname "$dest")"
   cat >"$dest" <<'EOF'
 #!/usr/bin/env bash
-# Runs inside the Ubuntu 26.04 LXC. Deploy Project NOMAD non-interactively.
+# Base Ubuntu setup only. Docker and Project NOMAD are the host post-install hook.
 # Copyright (c) 2021-2026 community-scripts ORG
 # License: MIT | https://github.com/community-scripts/ProxmoxVE/raw/main/LICENSE
-# Source: https://github.com/Crosstalk-Solutions/project-nomad
+# Source: https://ubuntu.com/
 
 source /dev/stdin <<<"$FUNCTIONS_FILE_PATH"
 color
@@ -38,23 +40,33 @@ setting_up_container
 network_check
 update_os
 
+motd_ssh
+customize
+cleanup_lxc
+EOF
+  chmod 755 "$dest"
+}
+
+# Standalone guest script. No helper-script functions: pct exec runs it later.
+_nomad_write_guest_script() {
+  local dest="$1"
+  cat >"$dest" <<'EOF'
+#!/usr/bin/env bash
+# Inside the Ubuntu 26.04 LXC. Docker first, then Project NOMAD.
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
 NOMAD_INSTALL_URL="https://raw.githubusercontent.com/Crosstalk-Solutions/project-nomad/refs/heads/main/install/install_nomad.sh"
 
-msg_info "Installing Project NOMAD prerequisites"
-$STD apt-get install -y sudo curl ca-certificates gnupg iproute2 pciutils
-msg_ok "Installed prerequisites"
+echo "Installing prerequisites"
+apt-get update
+apt-get install -y sudo curl ca-certificates gnupg iproute2 pciutils
 
-# disk-collector bind-mounts / with rslave. The installer aborts unless /
-# propagation is shared or slave, which a fresh LXC root usually is not.
-msg_info "Configuring root mount propagation"
+echo "Configuring root mount propagation"
 prop="$(findmnt -no PROPAGATION --target / 2>/dev/null || true)"
 case "$prop" in
 shared* | slave*) ;;
 *)
-  if ! mount --make-rshared /; then
-    msg_error "Could not set shared mount propagation on /. Project NOMAD requires it."
-    exit 1
-  fi
+  mount --make-rshared /
   ;;
 esac
 cat >/etc/systemd/system/nomad-mount-propagation.service <<'UNIT'
@@ -71,20 +83,17 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 UNIT
-$STD systemctl enable nomad-mount-propagation.service
-msg_ok "Root mount propagation is shared"
+systemctl enable nomad-mount-propagation.service
 
-# Official Engine install for Ubuntu, including 26.04 (Resolute). Done before
-# the NOMAD installer so that script finds Docker + Compose and does not fall
-# through to https://get.docker.com.
-msg_info "Installing Docker Engine"
+echo "Installing Docker Engine"
 for pkg in docker.io docker-doc docker-compose docker-compose-v2 podman-docker containerd runc; do
   apt-get remove -y "$pkg" >/dev/null 2>&1 || true
 done
-$STD apt-get install -y ca-certificates curl
+apt-get install -y ca-certificates curl
 install -m 0755 -d /etc/apt/keyrings
 curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
 chmod a+r /etc/apt/keyrings/docker.asc
+# shellcheck disable=SC1091
 . /etc/os-release
 cat >/etc/apt/sources.list.d/docker.sources <<DOCK
 Types: deb
@@ -94,48 +103,70 @@ Components: stable
 Architectures: $(dpkg --print-architecture)
 Signed-By: /etc/apt/keyrings/docker.asc
 DOCK
-$STD apt-get update
-$STD apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-$STD systemctl enable --now docker
-msg_ok "Installed Docker Engine"
+apt-get update
+apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+systemctl enable --now docker
 
-msg_info "Confirming Docker is running"
+echo "Confirming Docker is running"
 if ! systemctl is-active --quiet docker; then
-  msg_error "Docker is installed but the service is not active. NOMAD will not be installed."
+  echo "Docker is installed but the service is not active. NOMAD will not be installed." >&2
   exit 1
 fi
 if ! docker info >/tmp/docker-info.log 2>&1; then
-  msg_error "docker info failed. NOMAD will not be installed."
-  cat /tmp/docker-info.log
+  echo "docker info failed. NOMAD will not be installed." >&2
+  cat /tmp/docker-info.log >&2
   exit 1
 fi
 if ! docker compose version >/tmp/docker-compose.log 2>&1; then
-  msg_error "Docker Compose v2 is not available. NOMAD will not be installed."
-  cat /tmp/docker-compose.log
+  echo "Docker Compose v2 is not available. NOMAD will not be installed." >&2
+  cat /tmp/docker-compose.log >&2
   exit 1
 fi
 if ! docker run --rm hello-world >/tmp/docker-hello.log 2>&1; then
-  msg_error "Docker could not run a container (hello-world). NOMAD will not be installed."
-  cat /tmp/docker-hello.log
+  echo "Docker could not run a container (hello-world). NOMAD will not be installed." >&2
+  cat /tmp/docker-hello.log >&2
   exit 1
 fi
 docker rmi hello-world >/dev/null 2>&1 || true
-msg_ok "Docker Engine and Compose are ready ($(docker compose version --short 2>/dev/null || docker compose version))"
+echo "Docker Engine and Compose are ready ($(docker compose version --short 2>/dev/null || docker compose version))"
 
-msg_info "Deploying Project NOMAD"
+echo "Deploying Project NOMAD"
 curl -fsSL --retry 5 --retry-delay 2 "$NOMAD_INSTALL_URL" -o /tmp/install_nomad.sh
 chmod 755 /tmp/install_nomad.sh
 # Upstream asks twice (continue, then Apache-2.0 terms) and has no unattended flag.
-if ! printf 'y\ny\n' | bash /tmp/install_nomad.sh; then
-  msg_error "Project NOMAD installer failed"
+printf 'y\ny\n' | bash /tmp/install_nomad.sh
+rm -f /tmp/install_nomad.sh
+echo "Deployed Project NOMAD"
+EOF
+  chmod 755 "$dest"
+}
+
+# Host hook. The engine runs this after the CT is up. pct exec does not use
+# the guest console, so a login prompt cannot swallow the script.
+_nomad_write_post_hook() {
+  local dest="$1"
+  local guest="$2"
+  cat >"$dest" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ -z "\${CTID:-}" ]]; then
+  echo "Post-install hook: CTID is not set" >&2
   exit 1
 fi
-rm -f /tmp/install_nomad.sh
-msg_ok "Deployed Project NOMAD"
-
-motd_ssh
-customize
-cleanup_lxc
+say() {
+  printf '%s\n' "\$*"
+  printf '%s\n' "\$*" >/dev/tty 2>/dev/null || true
+}
+say "Installing Docker and Project NOMAD in CT \${CTID} with pct exec"
+pct push "\${CTID}" "${guest}" /root/nomad-guest-setup.sh
+set -o pipefail
+if [[ -e /dev/tty ]]; then
+  pct exec "\${CTID}" -- bash /root/nomad-guest-setup.sh | tee /dev/tty
+else
+  pct exec "\${CTID}" -- bash /root/nomad-guest-setup.sh
+fi
+pct exec "\${CTID}" -- rm -f /root/nomad-guest-setup.sh
+say "Project NOMAD is ready at http://\${IP:-<container-ip>}:8080"
 EOF
   chmod 755 "$dest"
 }
@@ -158,7 +189,10 @@ if [[ -z "$_nomad_root" ]]; then
   export COMMUNITY_SCRIPTS_ROOT="${_nomad_root}"
 fi
 _nomad_write_install_script "${_nomad_root}/install/nomad-install.sh"
-unset _nomad_self _nomad_root _dir
+_nomad_stage="$(mktemp -d "${TMPDIR:-/tmp}/nomad-post.XXXXXX")"
+_nomad_write_guest_script "${_nomad_stage}/nomad-guest-setup.sh"
+_nomad_write_post_hook "${_nomad_stage}/nomad-post-install.sh" "${_nomad_stage}/nomad-guest-setup.sh"
+unset _nomad_self _dir
 
 _cs_boot="${COMMUNITY_SCRIPTS_CORE_DIR:-$(dirname "${BASH_SOURCE[0]}")/../../core}/core/build.func"
 source "$_cs_boot" 2>/dev/null || source <(curl -fsSL "${COMMUNITY_SCRIPTS_CORE_URL:-https://raw.githubusercontent.com/community-scripts/core/main}/core/build.func")
@@ -215,6 +249,10 @@ function update_script() {
 }
 
 start
+# Set after the wizard so Default settings cannot clear it. The engine runs
+# this on the host once the CT is up (pct exec), not through the guest console.
+var_post_install="${_nomad_stage}/nomad-post-install.sh"
+export var_post_install
 build_container
 description
 
