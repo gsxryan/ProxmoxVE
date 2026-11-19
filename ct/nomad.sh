@@ -3,10 +3,12 @@
 # Upstream CT pattern: https://github.com/community-scripts/ProxmoxVE/blob/main/ct/ubuntu.sh
 # Application:          https://github.com/Crosstalk-Solutions/project-nomad
 #
-# Creates an unprivileged Ubuntu 26.04 LXC, then uses the engine's
-# var_post_install hook (runs on the Proxmox host, after the CT is up)
-# to install Docker and Project NOMAD with pct exec. That avoids typing
-# the installer into the guest console, which sits at a login prompt.
+# Creates an unprivileged Ubuntu 26.04 LXC (console mode "shell", so the
+# Proxmox console is a root shell and not the tty1 login). Docker and
+# Project NOMAD are installed afterwards by the engine's var_post_install
+# hook, which uses pct exec on the host. Ubuntu 26.04 agetty otherwise
+# sits at "login:" eating noVNC cursor replies (^[[24;80R) and the step
+# after "Container customized" never continues.
 #   https://docs.docker.com/engine/install/ubuntu/
 #   https://raw.githubusercontent.com/Crosstalk-Solutions/project-nomad/refs/heads/main/install/install_nomad.sh
 #
@@ -20,8 +22,7 @@
 
 # install/nomad-install.sh is what the engine runs with lxc-attach while it
 # still owns the terminal. Keep that step to base OS setup. Docker and NOMAD
-# run later from the host post-install hook, via pct exec, so nothing is
-# pasted into the guest's login prompt.
+# run later from the host post-install hook.
 _nomad_write_install_script() {
   local dest="$1"
   mkdir -p "$(dirname "$dest")"
@@ -36,6 +37,33 @@ source /dev/stdin <<<"$FUNCTIONS_FILE_PATH"
 color
 verb_ip6
 catch_errors
+
+# tty1 on Ubuntu 26.04 is agetty. It sends ESC[6n, Proxmox noVNC answers
+# ^[[24;80R, and that answer is used as the login name, so the console
+# never reaches a shell. TERM=linux stops the query; autologin skips the prompt.
+if command -v systemctl >/dev/null 2>&1; then
+  install -d /etc/systemd/system/container-getty@1.service.d \
+    /etc/systemd/system/container-getty@2.service.d \
+    /etc/systemd/system/console-getty.service.d
+  for unit in container-getty@1 container-getty@2; do
+    cat >"/etc/systemd/system/${unit}.service.d/override.conf" <<'UNIT'
+[Service]
+Environment=TERM=linux
+ExecStart=
+ExecStart=-/sbin/agetty --autologin root --noclear --keep-baud tty%I 115200,38400,9600 linux
+UNIT
+  done
+  cat >/etc/systemd/system/console-getty.service.d/override.conf <<'UNIT'
+[Service]
+Environment=TERM=linux
+ExecStart=
+ExecStart=-/sbin/agetty --autologin root --noclear --keep-baud console 115200,38400,9600 linux
+UNIT
+  grep -q '^TERM=linux' /etc/environment 2>/dev/null || echo 'TERM=linux' >>/etc/environment
+  systemctl daemon-reload 2>/dev/null || true
+  systemctl restart container-getty@1.service console-getty.service 2>/dev/null || true
+fi
+
 setting_up_container
 network_check
 update_os
@@ -171,6 +199,70 @@ EOF
   chmod 755 "$dest"
 }
 
+# The engine runs the guest setup with `lxc-attach` on the host terminal.
+# On Ubuntu 26.04 that attach sits on tty1, which is stuck at the login in
+# the screenshot. Fix getty first, then attach with stdin closed so
+# cursor-position replies cannot be typed in as a username.
+_nomad_write_attach_wrapper() {
+  local dest="$1"
+  mkdir -p "$(dirname "$dest")"
+  cat >"$dest" <<'EOF'
+#!/bin/bash
+real=/usr/bin/lxc-attach
+[[ -x "$real" ]] || exit 127
+ctid=""
+prev=""
+for a in "$@"; do
+  [[ "$prev" == "-n" ]] && ctid="$a"
+  prev="$a"
+done
+cmd=()
+seen=0
+for a in "$@"; do
+  if [[ $seen -eq 1 ]]; then
+    cmd+=("$a")
+  elif [[ "$a" == "--" ]]; then
+    seen=1
+  fi
+done
+if [[ -z "$ctid" || ${#cmd[@]} -eq 0 ]]; then
+  exec "$real" "$@"
+fi
+flag="${TMPDIR:-/tmp}/nomad-console-fixed-${ctid}"
+if [[ ! -f "$flag" ]]; then
+  if "$real" -n "$ctid" -- bash -s >/dev/null 2>&1 <<'FIX'; then
+set +e
+if command -v systemctl >/dev/null 2>&1; then
+  install -d /etc/systemd/system/container-getty@1.service.d \
+    /etc/systemd/system/container-getty@2.service.d \
+    /etc/systemd/system/console-getty.service.d
+  for unit in container-getty@1 container-getty@2; do
+    cat >"/etc/systemd/system/${unit}.service.d/override.conf" <<'UNIT'
+[Service]
+Environment=TERM=linux
+ExecStart=
+ExecStart=-/sbin/agetty --autologin root --noclear --keep-baud tty%I 115200,38400,9600 linux
+UNIT
+  done
+  cat >/etc/systemd/system/console-getty.service.d/override.conf <<'UNIT'
+[Service]
+Environment=TERM=linux
+ExecStart=
+ExecStart=-/sbin/agetty --autologin root --noclear --keep-baud console 115200,38400,9600 linux
+UNIT
+  grep -q '^TERM=linux' /etc/environment 2>/dev/null || echo 'TERM=linux' >>/etc/environment
+  systemctl daemon-reload 2>/dev/null || true
+  systemctl restart container-getty@1.service console-getty.service 2>/dev/null || true
+fi
+FIX
+    touch "$flag" 2>/dev/null || true
+  fi
+fi
+exec "$real" -n "$ctid" -- "${cmd[@]}" </dev/null
+EOF
+  chmod 755 "$dest"
+}
+
 _nomad_self="${BASH_SOURCE[0]:-}"
 _nomad_root=""
 if [[ -n "$_nomad_self" && -f "$_nomad_self" ]]; then
@@ -192,6 +284,7 @@ _nomad_write_install_script "${_nomad_root}/install/nomad-install.sh"
 _nomad_stage="$(mktemp -d "${TMPDIR:-/tmp}/nomad-post.XXXXXX")"
 _nomad_write_guest_script "${_nomad_stage}/nomad-guest-setup.sh"
 _nomad_write_post_hook "${_nomad_stage}/nomad-post-install.sh" "${_nomad_stage}/nomad-guest-setup.sh"
+_nomad_write_attach_wrapper "${_nomad_stage}/bin/lxc-attach"
 unset _nomad_self _dir
 
 _cs_boot="${COMMUNITY_SCRIPTS_CORE_DIR:-$(dirname "${BASH_SOURCE[0]}")/../../core}/core/build.func"
@@ -249,10 +342,13 @@ function update_script() {
 }
 
 start
-# Set after the wizard so Default settings cannot clear it. The engine runs
-# this on the host once the CT is up (pct exec), not through the guest console.
+# shell: Proxmox opens a root shell instead of the tty1 login that is eating
+# cursor-position replies. Set after the wizard so Default cannot clear it.
+CT_CMODE=shell
+export CT_CMODE
 var_post_install="${_nomad_stage}/nomad-post-install.sh"
 export var_post_install
+export PATH="${_nomad_stage}/bin:${PATH}"
 build_container
 description
 
