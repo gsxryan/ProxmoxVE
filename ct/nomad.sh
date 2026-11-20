@@ -263,6 +263,47 @@ _nomad_write_post_hook "${_nomad_stage}/nomad-post-install.sh" "${_nomad_stage}/
 _nomad_write_attach_wrapper "${_nomad_stage}/bin/lxc-attach"
 unset _nomad_self _dir
 
+# Proxmox notes ignore width and height, so the stock banner is drawn full size.
+# A shields badge stays small. The service URL is the same line the install prints.
+_nomad_set_notes() {
+  local nomad_ip="${IP:-}"
+  if [[ -z "$nomad_ip" && -n "${CTID:-}" ]]; then
+    nomad_ip="$(pct exec "$CTID" -- ip -4 addr show dev eth0 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -n1 || true)"
+  fi
+  if [[ -z "$nomad_ip" && -n "${CTID:-}" ]]; then
+    nomad_ip="$(pct exec "$CTID" -- ip -6 addr show dev eth0 scope global 2>/dev/null | awk '/inet6 / {print $2}' | cut -d/ -f1 | head -n1 || true)"
+  fi
+  IP="${nomad_ip}"
+  local notes
+  if [[ -n "$nomad_ip" ]]; then
+    notes=$(
+      cat <<EOF
+<div align='center'>
+  <a href='https://community-scripts.org' target='_blank' rel='noopener noreferrer'>
+    <img src='https://img.shields.io/badge/Community--Scripts-00617f' alt='Community-Scripts'/>
+  </a>
+  <h2 style='font-size: 18px; margin: 10px 0 6px 0;'>Nomad LXC</h2>
+  <p style='margin: 6px 0;'>Nomad: <a href='http://${nomad_ip}:8080' target='_blank' rel='noopener noreferrer'>http://${nomad_ip}:8080</a></p>
+  <p style='margin: 6px 0;'>Logs: <a href='http://${nomad_ip}:9999' target='_blank' rel='noopener noreferrer'>http://${nomad_ip}:9999</a></p>
+</div>
+EOF
+    )
+  else
+    notes=$(
+      cat <<'EOF'
+<div align='center'>
+  <a href='https://community-scripts.org' target='_blank' rel='noopener noreferrer'>
+    <img src='https://img.shields.io/badge/Community--Scripts-00617f' alt='Community-Scripts'/>
+  </a>
+  <h2 style='font-size: 18px; margin: 10px 0 6px 0;'>Nomad LXC</h2>
+  <p style='margin: 6px 0;'>Nomad: no address assigned yet. Open port 8080 on the container IP.</p>
+</div>
+EOF
+    )
+  fi
+  pct set "$CTID" -description "$notes" || true
+}
+
 # Re-run Docker + Project NOMAD inside a container that already exists.
 # The create step can fail after "Container customized" when the guest reboots
 # and the first attach finds no install log. Example:
@@ -294,11 +335,31 @@ if [[ -n "${NOMAD_CTID:-}" ]]; then
   pct exec "$NOMAD_CTID" -- bash /root/nomad-guest-setup.sh </dev/null 2>&1 | tee -a "/tmp/nomad-ct-${NOMAD_CTID}.log"
   rc=${PIPESTATUS[0]}
   pct exec "$NOMAD_CTID" -- rm -f /root/nomad-guest-setup.sh >/dev/null 2>&1 || true
+  CTID="$NOMAD_CTID"
+  _nomad_set_notes
+  if [[ -n "${IP:-}" ]]; then
+    echo "Nomad: http://${IP}:8080"
+  fi
   exit "$rc"
 fi
 
 _cs_boot="${COMMUNITY_SCRIPTS_CORE_DIR:-$(dirname "${BASH_SOURCE[0]}")/../../core}/core/build.func"
 source "$_cs_boot" 2>/dev/null || source <(curl -fsSL "${COMMUNITY_SCRIPTS_CORE_URL:-https://raw.githubusercontent.com/community-scripts/core/main}/core/build.func")
+
+# Proxmox notes ignore width/height and draw logo-description.png at full size,
+# which fills the panel. Stock description() also runs the post-install hook,
+# so keep it, then replace the notes with a short block that includes the URL.
+_nomad_desc_src="$(mktemp)"
+declare -f description >"$_nomad_desc_src"
+sed -i '1s/^description /_nomad_stock_description /' "$_nomad_desc_src"
+source "$_nomad_desc_src"
+rm -f "$_nomad_desc_src"
+
+description() {
+  _nomad_stock_description
+  _nomad_set_notes
+}
+
 # Copyright (c) 2021-2026 tteck
 # Author: tteck (tteckster)
 # License: MIT | https://github.com/community-scripts/ProxmoxVE/raw/main/LICENSE
@@ -364,10 +425,9 @@ export var_post_install
 export PATH="${_nomad_stage}/bin:${PATH}"
 build_container
 description
+_nomad_set_notes
 
 msg_ok "Completed successfully!\n"
 echo -e "${CREATING}${GN}Project NOMAD setup has been successfully initialized!${CL}"
-echo -e "${INFO}${YW}Access it using the following URL:${CL}"
-echo -e "${GATEWAY}${BGN}http://${IP}:8080${CL}"
-echo -e "${INFO}${YW}Container logs (Dozzle):${CL}"
-echo -e "${GATEWAY}${BGN}http://${IP}:9999${CL}"
+echo -e "${INFO}${YW}Nomad: ${CL}${GATEWAY}${BGN}http://${IP}:8080${CL}"
+echo -e "${INFO}${YW}Logs: ${CL}${GATEWAY}${BGN}http://${IP}:9999${CL}"
